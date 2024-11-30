@@ -1,0 +1,293 @@
+import math
+import torch
+import torch.nn as nn
+from torch import Tensor
+from torchsummary import summary
+from typing import Callable, Optional
+
+class Bottle2neck(nn.Module):
+    expansion = 4   
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None, baseWidth=26, scale = 4, stype='normal'):
+        """ Constructor
+        Args:
+            inplanes: input channel dimensionality
+            planes: output channel dimensionality
+            stride: conv stride. Replaces pooling layer.
+            downsample: None when stride = 1
+            baseWidth: basic width of conv3x3
+            scale: number of scale.
+            type: 'normal': normal set. 'stage': first block of a new stage.
+        """
+        super(Bottle2neck, self).__init__()
+
+        width      = int(math.floor(planes * (baseWidth/64.0)))
+        self.conv1 = nn.Conv2d(inplanes, width*scale, kernel_size=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(width*scale)
+        
+        if scale == 1:
+          self.nums = 1
+        else:
+          self.nums = scale -1
+        if stype == 'stage':
+            self.pool = nn.AvgPool2d(kernel_size=3, stride = stride, padding=1)
+
+        convs = []
+        bns = []
+        for i in range(self.nums):
+          convs.append(nn.Conv2d(width, width, kernel_size=3, stride = stride, padding=1, bias=False))
+          bns.append(nn.BatchNorm2d(width))
+        self.convs = nn.ModuleList(convs)
+        self.bns = nn.ModuleList(bns)
+
+        self.conv3 = nn.Conv2d(width*scale, planes * self.expansion, kernel_size=1, bias=False)
+        self.bn3   = nn.BatchNorm2d(planes * self.expansion)
+
+        self.relu       = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stype      = stype
+        self.scale      = scale
+        self.width      = width
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        spx = torch.split(out, self.width, 1)
+        for i in range(self.nums):
+          if i==0 or self.stype=='stage':
+            sp = spx[i]
+          else:
+            sp = sp + spx[i]
+          sp = self.convs[i](sp)
+          sp = self.relu(self.bns[i](sp))
+          if i==0:
+            out = sp
+          else:
+            out = torch.cat((out, sp), 1)
+
+        if self.scale != 1 and self.stype=='normal':
+          out = torch.cat((out, spx[self.nums]),1)
+        elif self.scale != 1 and self.stype=='stage':
+          out = torch.cat((out, self.pool(spx[self.nums])),1)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual   # 2022/02/19 This line must be removed.
+        out = self.relu(out)
+
+        return out
+    
+def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+
+def fusion(xin:Tensor,xup:Tensor,xmid:Tensor,xdown:Tensor):
+    xout = (torch.cat((xup*xmid,xdown*xmid),1)) + xin
+    return xout
+
+class MSFBlock(nn.Module):
+    # MSF Block
+    # expansion: int = 4
+    
+    def __init__(
+        self,
+        planes: int,
+        wxh:int,
+        norm_layer: Optional[Callable[..., nn.Module]] = None) -> None:
+        
+        super(MSFBlock, self).__init__()
+        
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+            
+        width = int(planes)
+        out_width = int(wxh)
+
+        self.conv1 = conv1x1(width, out_width)
+        self.avgpool1 = nn.AdaptiveAvgPool2d((1, 1))         
+        self.bn2 = norm_layer(out_width)
+        
+        self.conv2 = conv1x1(width, out_width)
+        self.avgpool2 = nn.AdaptiveAvgPool2d((1, 1))         
+        self.bn3 = norm_layer(out_width)
+        self.relu = nn.ReLU(inplace=True)
+        
+
+    def forward(self, x: Tensor) -> Tensor:
+        xOF = x        
+        out = self.conv1(x)
+        out = self.avgpool1(out)
+        out = xOF*out
+        
+        out = self.bn2(out)
+        out = self.relu(out)
+        xOF = out
+
+        out = self.conv2(out)
+        out = self.avgpool2(out)
+        out = xOF*out
+        
+        out = self.bn3(out)
+        out = self.relu(out)
+             
+        return out
+    
+class VONet_BFA_ResNet(nn.Module):
+
+    def __init__(self, 
+                 block=Bottle2neck, 
+                 layers=[3, 4], 
+                 baseWidth = 26, 
+                 scale = 8, 
+                 num_classes=1000,
+                 norm_layer: Optional[Callable[..., nn.Module]] = None):
+        
+        self.inplanes  = 64
+        super(VONet_BFA_ResNet, self).__init__()
+        self.norm_layer = norm_layer
+        
+        c1, c2, c3, c4, c5, d1 = 64, 128, 256, 512, 1024, 256        
+        det_h = 65       
+        
+        # input-convolution  (H, W, C) -> (30, 40, 128)
+        self.baseWidth = baseWidth
+        self.scale     = scale
+        self.conv0     = nn.Conv2d(1, c1, kernel_size=7, stride=2, padding=3, bias=False) # c1 (1 -> 64)
+        self.bn1       = nn.BatchNorm2d(c1)                                               # c1 : 64                                           
+        self.relu      = nn.ReLU(inplace=True)
+        self.maxpool   = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1    = self._make_layer(block, c1, layers[0])                           # c1 (64 -> 256)
+        self.layer2    = self._make_layer(block, c2, layers[1], stride=2)                 # c2 (128-> 512)        
+        self.conv      = conv1x1(c4,c3)
+        
+        # upper-layer (H, W, C) -> ( 30, 40, 512)
+        self.upsample1 = nn.Sequential(
+             nn.Upsample(scale_factor=2, mode='bilinear',align_corners=True),             # (2H,2W)=>(60,80) 
+             nn.Conv2d(c3, c2, kernel_size=3, stride=1, padding=1),                       # c3 -> c2 (256 -> 128)
+             nn.BatchNorm2d(c2),
+             nn.ReLU(inplace=True))
+                                                                                                 
+        self.upperlayer = MSFBlock(c2,c2,self.norm_layer)                                 # c2 -> c2 ( 128 -> 128)
+        self.downsample2 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            conv1x1(c2,c3))  # c2 -> c3 ( 128 -> 256) 
+                    
+        # middle-layer  (H, W, C) -> (30, 40, 512)
+        self.middlelayer = nn.Sequential(
+            nn.Conv2d(c3, c3, kernel_size=3, stride=1, padding=1),                        # c3 -> c3 (256 -> 256)
+            nn.BatchNorm2d(c3),
+            nn.ReLU(inplace=True),
+            MSFBlock(c3,c3,self.norm_layer))                                              # c3 -> c3 (256 -> 256) 
+                   
+        # down-layer (H, W, C) -> (30, 40, 512)
+        self.downsample1 = nn.Sequential(
+             nn.AvgPool2d(kernel_size=2, stride=2),                  # (H/2, W/2) (15,20) 
+             nn.Conv2d(c3, c4, kernel_size=3, stride=1, padding=1),  # c3 -> c4 (256 -> 512)
+             nn.BatchNorm2d(c4),
+             nn.ReLU(inplace=True))               
+               
+        self.downlayer = MSFBlock(c4,c4,self.norm_layer)             # c4 -> c4 ( 512 -> 512)   
+        self.upsample2 = nn.Sequential(                               
+            nn.Upsample(scale_factor=2, mode='bilinear',align_corners=True), 
+            conv1x1(c4,c3))  # c4 -> c3 ( 512 -> 256)
+                                                
+        # Fusion          
+        self.fusion = fusion
+                                                          
+        # Detector Head.
+        self.convPa = torch.nn.Conv2d(c4, c3, kernel_size=3, stride=1, padding=1)      # c5 -> c3 (1024 -> 256)
+        self.bnPa   = nn.BatchNorm2d(c3)
+        self.convPb = torch.nn.Conv2d(c3, det_h, kernel_size=1, stride=1, padding=0)   # c3 -> det_h (256 -> 65) 
+        self.bnPb   = nn.BatchNorm2d(det_h)
+        
+        # Descriptor Head.
+        self.convDa = torch.nn.Conv2d(c4, c3, kernel_size=3, stride=1, padding=1)      # c4 -> c3 (512 -> 256)
+        self.bnDa   = nn.BatchNorm2d(c3)
+        self.convDb = torch.nn.Conv2d(c3, d1, kernel_size=1, stride=1, padding=0)      # c3 -> d1 (256 -> 256)
+        self.bnDb   = nn.BatchNorm2d(d1)               
+        
+        self.output = None        
+        
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample=downsample, 
+                        stype='stage', baseWidth = self.baseWidth, scale=self.scale))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes, baseWidth = self.baseWidth, scale=self.scale))
+
+        return nn.Sequential(*layers)
+    
+
+    def forward(self, x):
+        
+        # Res2Net stage2
+        x  = self.conv0(x)
+        x  = self.bn1(x)
+        x  = self.relu(x)
+        x  = self.maxpool(x)
+                
+        x  = self.layer1(x)        
+        xin1 = self.layer2(x)                       # x:[-1,512,30,40]   
+        
+        # Dimension Reduction
+        xin  = self.conv(xin1)                      # x:[-1,256,30,40]
+                         
+        # upper-layer                   
+        x1 = self.upsample1(xin)                    # x:[-1,128,60,80]                                                                                  
+        x1 = self.upperlayer(x1)                    # x:[-1,128,60,80]                     
+                
+        # middle-layer            
+        x2 = self.middlelayer(xin)                  # x:[-1,256,30,40]                                           
+                       
+        # down-layer
+        x3 = self.downsample1(xin)                  # x:[-1,512,15,20]                                                                                                 
+        x3 = self.downlayer(x3)                     # x:[-1,512,15,20] 
+                                              
+        # Multi-scale fusion 
+        downsample = self.downsample2(x1)           # x1:[-1,256,30,40]                                                       
+        upsample   = self.upsample2(x3)             # x3:[-1,256,30,40]                                                                                                 
+        x4         = self.fusion(xin1,downsample,x2,upsample) # [-1,256,30,40]    
+               
+        # Detector Head.
+        cPa = self.relu(self.bnPa(self.convPa(x4)))        
+        semi = self.bnPb(self.convPb(cPa))
+        
+        # Descriptor Head.
+        cDa = self.relu(self.bnDa(self.convDa(x4)))
+        desc = self.bnDb(self.convDb(cDa))   
+        
+        # Channel-wise L2 normalization (L2-norm)
+        dn = torch.norm(desc, p=2, dim=1)       # Compute the norm.
+        desc = desc.div(torch.unsqueeze(dn, 1)) # Divide by norm to normalize.  
+                     
+        output = {'semi': semi, 'desc': desc}
+        
+        self.output = output             
+        return output    
+
+if __name__ == '__main__':   
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = VONet_BFA_ResNet()
+    model = model.to(device)
+    summary(model, input_size=(1, 240, 320))
+
